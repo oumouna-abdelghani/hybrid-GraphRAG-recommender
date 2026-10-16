@@ -1,4 +1,6 @@
 .env
+.chroma_tv_recommender/
 __pycache__/
-venv/
+*.pyc
 .venv/
+venv/

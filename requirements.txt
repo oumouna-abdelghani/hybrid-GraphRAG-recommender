@@ -2,3 +2,5 @@ google-genai
 python-dotenv
 scipy
 numpy
+ChromaDB
+Pandas
