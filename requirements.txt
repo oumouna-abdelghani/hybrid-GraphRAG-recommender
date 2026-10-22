@@ -4,3 +4,4 @@ scipy
 numpy
 ChromaDB
 Pandas
+neo4j
