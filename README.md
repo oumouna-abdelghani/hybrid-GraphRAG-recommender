@@ -35,6 +35,8 @@ Rather than relying on an LLM to generate database queries, the engine uses dete
 - **Knowledge Graph:** Neo4j
 - **Embeddings:** Google Gemini API (`gemini-embedding-001`)
 - **Text Generation:** Google Gemini API (`gemini-3.5-flash-lite`)
+- **Agent Memory Framework:** `neo4j-agent-memory`
+- **Memory Embeddings:** Local Hugging Face Model (`BAAI/bge-small-en-v1.5` via `sentence-transformers`)
 - **Data Processing:** Pandas
 - **Other Tools:** NumPy, SciPy, regular expressions, Unicode normalization, SHA-256 hashing
 
@@ -169,6 +171,11 @@ GEMINI_GENERATION_MODEL=gemini-3.5-flash-lite
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=your_neo4j_password
+
+# Agent Memory
+MEMORY_ENABLED=true
+MEMORY_USER_ID=default-user
+MEMORY_EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 ```
 
 Replace the placeholder values with your actual credentials.
@@ -207,6 +214,9 @@ Integrated Neo4j to model relationships between titles and people, combined grap
 
 The implementation uses deterministic entity extraction and predefined Cypher queries rather than unconstrained LLM-generated database queries.
 
+### Phase 4 — Persistent Agent Memory & Reasoning Traces
+Integrated neo4j-agent-memory with local Hugging Face embeddings (bge-small-en-v1.5) to add multi-turn session continuity, persistent long-term taste preferences across restarts, and auditable reasoning traces inside Neo4j.
+
 **Representative commit:**
 
 `feat: implement hybrid GraphRAG retrieval with Neo4j and grounded Gemini explanations`
@@ -214,7 +224,7 @@ The implementation uses deterministic entity extraction and predefined Cypher qu
 ## Future Improvements
 
 - [ ] **Streamlit Web UI:** Build an interactive interface for conversational queries, ranked recommendations, metadata filters, and explanations.
-- [ ] **Recommendation Personalization:** Incorporate user feedback, liked titles, and viewing history to improve recommendations.
+- [X] **Recommendation Personalization:** Incorporate user feedback, liked titles, and viewing history to improve recommendations.
 - [ ] **Evaluation:** Measure retrieval quality and compare semantic-only ranking against hybrid ranking.
 - [ ] **MCP Integration:** Expose the recommendation pipeline through a Model Context Protocol (MCP) server for use by compatible AI applications.
 - [ ] **Deployment:** Deploy the application with an appropriately hosted graph database and vector storage.

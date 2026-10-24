@@ -1,10 +1,20 @@
 import hashlib
 import os
 import re
+import time
 import unicodedata
 from collections import defaultdict
 from pathlib import Path
 
+import logging
+import warnings
+
+# Suppress standard Python warnings
+warnings.filterwarnings("ignore")
+
+# Suppress Neo4j driver DBMS server notifications
+logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
+logging.getLogger("neo4j").setLevel(logging.ERROR)
 import chromadb
 import pandas as pd
 from dotenv import load_dotenv
@@ -12,6 +22,8 @@ from google import genai
 from google.genai import errors, types
 from neo4j import GraphDatabase
 from neo4j.exceptions import AuthError, ServiceUnavailable
+
+from memory_manager import MemoryManager
 
 
 # --------------------------------------------------
@@ -84,6 +96,14 @@ ROLE_LABELS = {
 }
 
 NAME_SUFFIXES = {"jr", "sr"}
+
+# Memory personalization: long-term preferences nudge the final score.
+PREF_BOOST = 0.04        # per liked genre / decade / person a title matches
+PREF_PENALTY = 0.06      # per disliked match
+MAX_PREF_SWING = 0.15    # cap in both directions, like MAX_GRAPH_BONUS
+
+# Both sides of a genre comparison go through these.
+GENRE_SYNONYMS = {"science fiction": "sci fi", "scifi": "sci fi"}
 
 
 # --------------------------------------------------
@@ -532,7 +552,9 @@ ENTITY_INDEX = {
 }
 
 SEED_PATTERN = re.compile(
-    r"\b(?:like|similar to|same as|reminds? me of|in the style of)\s+(.+)",
+    r"\b(?:like|similar to|same as|reminds? me of|in the style of"
+    r"|(?:the\s+)?same\s+(?:actors?|cast|people|directors?|creators?|producers?)\s+as)"
+    r"\s+(.+)",
     re.IGNORECASE,
 )
 
@@ -898,7 +920,7 @@ def vector_search(query_embedding, n_results, where=None):
     return hits
 
 
-def hybrid_search(query, top_k=5, media_type=None, era=None):
+def hybrid_search(query, top_k=5, media_type=None, era=None, taste=None):
     """
     Combine both stores.
 
@@ -907,7 +929,9 @@ def hybrid_search(query, top_k=5, media_type=None, era=None):
        the vector search only looks at titles linked to them.
     3. "Like <title>" is a SOFT signal: titles sharing people or a
        franchise with it get a bonus on top of their semantic score.
-    4. Rank by similarity + bonus and attach graph context.
+    4. Long-term memory ("taste") is a SOFT signal too: titles matching
+       the user's saved preferences get a small capped bonus or penalty.
+    5. Rank by similarity + bonuses and attach graph context.
     """
 
     if not query.strip():
@@ -983,6 +1007,30 @@ def hybrid_search(query, top_k=5, media_type=None, era=None):
             ):
                 pool.setdefault(hit["id"], hit)
 
+    # Long-term memory: titles the user's taste favors must compete too.
+    # Otherwise a vague query ("something to watch tonight") would only
+    # surface whatever happens to sit closest to the query vector.
+    taste = taste or {}
+
+    liked_ids = sorted(
+        (title_id for title_id, (delta, _) in taste.items() if delta > 0),
+        key=lambda title_id: taste[title_id][0],
+        reverse=True,
+    )[:CANDIDATE_POOL]
+
+    if allowed_ids is not None:
+        liked_ids = [
+            title_id for title_id in liked_ids if title_id in allowed_ids
+        ]
+
+    if liked_ids:
+        for hit in vector_search(
+            query_embedding,
+            len(liked_ids),
+            build_where(media_type, era, liked_ids),
+        ):
+            pool.setdefault(hit["id"], hit)
+
     # "Movies like Inception" should not return Inception itself.
     seed_ids = {seed_id for seed_id, _ in seeds}
 
@@ -997,11 +1045,15 @@ def hybrid_search(query, top_k=5, media_type=None, era=None):
             GRAPH_BOOST * boosts.get(hit["id"], 0.0),
         )
 
+        taste_delta, taste_reasons = taste.get(hit["id"], (0.0, []))
+
         hit["graph_bonus"] = bonus
-        hit["score"] = hit["similarity"] + bonus
+        hit["taste_bonus"] = taste_delta
+        hit["score"] = hit["similarity"] + bonus + taste_delta
         hit["reasons"] = (
             person_reasons.get(hit["id"], [])
             + neighbor_reasons.get(hit["id"], [])
+            + taste_reasons
         )
 
         ranked.append(hit)
@@ -1035,7 +1087,8 @@ def print_results(query, hits):
             f"\n[{hit['score']:.3f}] "
             f"{metadata.get('title', 'Unknown title')}  "
             f"(semantic {hit['similarity']:.3f} "
-            f"+ graph {hit['graph_bonus']:.3f})"
+            f"+ graph {hit['graph_bonus']:.3f} "
+            f"+ taste {hit['taste_bonus']:+.3f})"
         )
 
         print(
@@ -1068,40 +1121,33 @@ def print_results(query, hits):
 # 8. OPTIONAL: LET GEMINI EXPLAIN THE PICKS (the "G" in RAG)
 # --------------------------------------------------
 
-def explain_results(query, hits):
-    """
-    Ask Gemini to explain the results using ONLY the retrieved
-    text and graph facts. Retrieval is what makes the answer
-    grounded; generation just puts it into words.
-    """
-
+def describe_hits(hits):
+    """Retrieved facts, one block per ranked hit, for a grounded prompt."""
     blocks = []
 
-    for hit in hits:
+    for number, hit in enumerate(hits, 1):
         metadata = hit["metadata"]
         graph = hit["graph"]
 
         makers = graph.get("directors", []) + graph.get("creators", [])
 
         blocks.append(
-            f"- {metadata.get('title')} "
+            f"- #{number} {metadata.get('title')} "
             f"({metadata.get('type')}, {metadata.get('release_year', 'n/a')})\n"
             f"  Plot: {graph.get('description') or 'n/a'}\n"
             f"  Directors/creators: {', '.join(makers) or 'n/a'}\n"
             f"  Cast: {', '.join(graph.get('cast', [])) or 'n/a'}\n"
-            f"  Graph links: {'; '.join(hit['reasons']) or 'none (semantic match only)'}"
+            f"  Score: semantic {hit['similarity']:.3f} "
+            f"+ graph {hit['graph_bonus']:.3f} "
+            f"+ taste {hit['taste_bonus']:+.3f}\n"
+            f"  Links: {'; '.join(hit['reasons']) or 'none (semantic match only)'}"
         )
 
-    prompt = (
-        "You are a movie and TV recommendation assistant.\n"
-        "Using ONLY the facts below, explain in 3 to 5 short sentences "
-        "why these titles fit the request. Mention shared people or "
-        "franchises when they appear under 'Graph links'. "
-        "Do not invent plot details, cast members, or connections.\n\n"
-        f"Request: {query}\n\n"
-        "Results:\n" + "\n".join(blocks)
-    )
+    return "\n".join(blocks)
 
+
+def ask_gemini(prompt):
+    """Send a prompt, print and return the answer ('' on API errors)."""
     try:
         response = client.models.generate_content(
             model=GENERATION_MODEL,
@@ -1109,20 +1155,279 @@ def explain_results(query, hits):
         )
     except errors.APIError as error:
         print(f"Could not generate an explanation: {error}")
-        return
+        return ""
 
-    print("\n" + (response.text or "").strip())
+    text = (response.text or "").strip()
+    print("\n" + text)
+    return text
+
+
+def explain_results(query, hits, memory_text=""):
+    """
+    Ask Gemini to explain the results using ONLY the retrieved
+    text, graph facts and the user's memory (the "G" in RAG).
+    """
+
+    prompt = (
+        "You are a movie and TV recommendation assistant.\n"
+        "Using ONLY the facts below, explain in 3 to 5 short sentences "
+        "why these titles fit the request. Mention shared people or "
+        "franchises when they appear under 'Links', and mention the user's "
+        "saved preferences when a 'taste:' link shows they mattered. "
+        "Do not invent plot details, cast members, or connections.\n\n"
+        f"Request: {query}\n\n"
+        f"Memory:\n{memory_text or 'none'}\n\n"
+        "Results:\n" + describe_hits(hits)
+    )
+
+    return ask_gemini(prompt)
+
+
+def explain_follow_up(question, hits, memory_text=""):
+    """Answer 'why did you pick that first option?' from the last ranked list."""
+
+    prompt = (
+        "You are a movie and TV recommendation assistant. The user is asking a "
+        "follow-up about the ranked list you just gave them (#1 is the top pick).\n"
+        "Answer in 3 to 5 short sentences using ONLY the ranked results (with "
+        "their score breakdown and links) and the memory below. Say which saved "
+        "preferences or graph links pushed a title up, if any. If the facts do "
+        "not answer the question, say so. Do not invent anything.\n\n"
+        f"Question: {question}\n\n"
+        f"Memory:\n{memory_text or 'none'}\n\n"
+        "Ranked results:\n" + describe_hits(hits)
+    )
+
+    return ask_gemini(prompt)
+
+
+# --------------------------------------------------
+# 8b. MEMORY: TASTE FROM TEXT, TASTE AS A SCORE
+# --------------------------------------------------
+
+# profile = {"like": {"person": {...}, "genre": {...}, "decade": {...}}, "dislike": {...}}
+# taste   = {title_id: (score_delta, [reasons])}   one entry per title the profile touches
+
+GENRE_INDEX = {}   # "sci fi" -> "Sci-Fi" (canonical genre name from the graph)
+
+REQUEST_START = re.compile(r"^\s*i\s*(?:'d|would|want|need)\b", re.IGNORECASE)
+STATEMENT_START = re.compile(r"^\s*(?:i\s|i'm\s|my\s|remember\b)", re.IGNORECASE)
+CLAUSE_SPLIT = re.compile(
+    r"\bbut\b|[;.!]|,?\s+and\s+(?=i\b)|,\s*(?=i\b)", re.IGNORECASE
+)
+NEGATIVE_WORDS = re.compile(
+    r"\b(?:hate|dislike|can'?t stand|don'?t like|do not like|avoid|not a fan of)\b",
+    re.IGNORECASE,
+)
+POSITIVE_WORDS = re.compile(
+    r"\b(?:love|like|enjoy|adore|prefer|fan of|into|favou?rite)\b", re.IGNORECASE
+)
+FOLLOW_UP_PATTERN = re.compile(
+    r"^\s*(?:why|how come|explain|what made)\b", re.IGNORECASE
+)
+
+
+def genre_key(text):
+    """Comparable genre form: 'Science Fiction' and 'Sci-Fi' both -> 'sci fi'."""
+    key = fold(text)
+
+    for phrase, short in GENRE_SYNONYMS.items():
+        key = re.sub(rf"\b{phrase}\b", short, key)
+
+    return key
+
+
+def load_genre_index():
+    records, _, _ = driver.execute_query("MATCH (g:Genre) RETURN g.name AS name")
+
+    GENRE_INDEX.clear()
+    GENRE_INDEX.update({genre_key(record["name"]): record["name"] for record in records})
+
+
+def clause_genres(clause):
+    """Genres mentioned in a clause, singular or plural ('thrillers', 'comedies')."""
+    folded = genre_key(clause)
+    found = []
+
+    for key, name in GENRE_INDEX.items():
+        forms = {key, key + "s", key + "es"}
+
+        if key.endswith("y"):
+            forms.add(key[:-1] + "ies")
+
+        if any(re.search(rf"\b{re.escape(form)}\b", folded) for form in forms):
+            found.append(name)
+
+    return found
+
+
+def parse_decades(text):
+    """'90s' / '1990s' / '80 s' -> ['1990s']."""
+    decades = []
+
+    for token in re.findall(r"\b(\d{4}|\d{2})\s?s\b", fold(text)):
+        year = int(token)
+
+        if year < 100:
+            year += 1900 if year >= 30 else 2000
+
+        if year % 10 == 0 and 1930 <= year <= 2020:
+            decades.append(f"{year}s")
+
+    return list(dict.fromkeys(decades))
+
+
+def parse_preferences(text):
+    """
+    'I love 90s sci-fi and anything produced by Christopher Nolan'
+      -> [('like', 'decade', '1990s'), ('like', 'genre', 'Sci-Fi'),
+          ('like', 'person', 'Christopher Nolan')]
+
+    Returns [] for anything that is not a taste statement, so it gets searched.
+    """
+    text = text.replace("’", "'")
+
+    if (
+        REQUEST_START.match(text)
+        or not STATEMENT_START.match(text)
+        or find_seed_titles(text)
+    ):
+        return []
+
+    found = []
+
+    for clause in CLAUSE_SPLIT.split(text):
+        if NEGATIVE_WORDS.search(clause):
+            polarity = "dislike"
+        elif POSITIVE_WORDS.search(clause):
+            polarity = "like"
+        else:
+            continue
+
+        found += [(polarity, "decade", value) for value in parse_decades(clause)]
+        found += [(polarity, "genre", value) for value in clause_genres(clause)]
+        found += [(polarity, "person", value) for value in find_people(clause)]
+
+    return list(dict.fromkeys(found))
+
+
+def describe_profile(profile):
+    """'likes: 1990s, Christopher Nolan, Sci-Fi | dislikes: Horror' ('' if empty)."""
+    parts = []
+
+    for side, label in (("like", "likes"), ("dislike", "dislikes")):
+        values = sorted(
+            value for group in profile.get(side, {}).values() for value in group
+        )
+
+        if values:
+            parts.append(f"{label}: {', '.join(values)}")
+
+    return " | ".join(parts)
+
+
+def print_preferences(profile):
+    summary = describe_profile(profile)
+    print(f"\nI remember: {summary}" if summary else "\nNo saved preferences yet.")
+
+
+def score_preferences(profile):
+    """Taste score for EVERY title the profile touches (see shapes above)."""
+    sides = [profile.get(side, {}) for side in ("like", "dislike")]
+
+    if not any(values for side in sides for values in side.values()):
+        return {}
+
+    names = sorted({name for side in sides for name in side.get("person", ())})
+    person_roles = defaultdict(lambda: defaultdict(set))  # name -> title_id -> roles
+
+    if names:
+        records, _, _ = driver.execute_query(
+            PEOPLE_LINKS_QUERY,
+            parameters_={"names": names},
+        )
+
+        for record in records:
+            person_roles[record["person"]][record["id"]].add(record["role"])
+
+    catalog = collection.get(include=["metadatas"])
+    taste = {}
+
+    for title_id, metadata in zip(catalog["ids"], catalog["metadatas"]):
+        genres = {genre_key(genre) for genre in split_list(metadata.get("genres"))}
+        year = metadata.get("release_year")
+        decade = f"{int(year) // 10 * 10}s" if year is not None else None
+
+        delta, reasons = 0.0, []
+
+        for side, label, weight in (
+            ("like", "likes", PREF_BOOST),
+            ("dislike", "dislikes", -PREF_PENALTY),
+        ):
+            wanted = profile.get(side, {})
+
+            matched = [g for g in wanted.get("genre", ()) if genre_key(g) in genres]
+            matched += [d for d in wanted.get("decade", ()) if d == decade]
+
+            for name in wanted.get("person", ()):
+                roles = person_roles[name].get(title_id)
+
+                if roles:
+                    role_text = "/".join(sorted(ROLE_LABELS[role] for role in roles))
+                    matched.append(f"{name} ({role_text})")
+
+            if matched:
+                delta += weight * len(matched)
+                reasons.append(f"taste: {label} {', '.join(matched)}")
+
+        if reasons:
+            clamped = max(-MAX_PREF_SWING, min(MAX_PREF_SWING, delta))
+            taste[title_id] = (clamped, reasons)
+
+    return taste
+
+
+def summarize_hits(hits):
+    """One line for conversation memory: 'Recommended: 1. Inception; 2. Tenet'."""
+    if not hits:
+        return "No matching titles found."
+
+    return "Recommended: " + "; ".join(
+        f"{number}. {hit['metadata'].get('title')}"
+        for number, hit in enumerate(hits, 1)
+    )
+
+
+def memory_context(memory, query):
+    """Saved preferences + conversation memory, as text for a Gemini prompt."""
+    parts = []
+
+    taste = describe_profile(memory.load_profile())
+
+    if taste:
+        parts.append(f"Saved user preferences -> {taste}")
+
+    history = memory.context(query)
+
+    if history:
+        parts.append(f"Conversation memory:\n{history}")
+
+    return "\n".join(parts)
 
 
 # --------------------------------------------------
 # 9. INTERACTIVE TERMINAL
 # --------------------------------------------------
 
-def run_terminal():
-    print("\nTV & Movie Hybrid Search (vectors + graph)")
+def run_terminal(memory):
+    print("\nTV & Movie Hybrid Search (vectors + graph + memory)")
     print("Try: 'movies with Leonardo DiCaprio', 'Nolan sci-fi',")
     print("     'something like Inception', 'a heist with clever twists'")
-    print("Type 'exit' as a query to quit.")
+    print("Tell me your taste: 'I love 90s sci-fi', 'I hate horror'.")
+    print("Follow up with: 'why did you pick the first one?'")
+    print("Commands: 'prefs' (what I remember), 'exit'.")
+
+    last_hits = []
 
     while True:
         query = input(
@@ -1134,6 +1439,38 @@ def run_terminal():
             break
 
         if not query:
+            continue
+
+        if query.lower() == "prefs":
+            print_preferences(memory.load_profile())
+            continue
+
+        memory.add_message("user", query)
+
+        # A taste statement goes to long-term memory; no search needed.
+        statements = parse_preferences(query) if memory.ready else []
+
+        if statements:
+            saved = []
+
+            for polarity, kind, value in statements:
+                if memory.save_preference(polarity, kind, value):
+                    saved.append(f"{polarity} {value}")
+
+            reply = f"Saved: {', '.join(saved)}." if saved else "I already had that."
+            print(f"\n{reply} Now I remember -> {describe_profile(memory.load_profile())}")
+            memory.add_message("assistant", reply)
+            continue
+
+        # A follow-up about the last results is answered from memory + those results.
+        if last_hits and FOLLOW_UP_PATTERN.match(query):
+            answer = explain_follow_up(
+                query, last_hits, memory_context(memory, query)
+            )
+
+            if answer:
+                memory.add_message("assistant", answer)
+
             continue
 
         print("\nMedia type:")
@@ -1172,14 +1509,64 @@ def run_terminal():
             print("Enter a positive whole number.")
             continue
 
-        hits = hybrid_search(
-            query=query,
-            top_k=top_k,
-            media_type=media_type,
-            era=era,
-        )
+        # The whole recommendation run is one auditable reasoning trace.
+        with memory.trace(f"Recommend: {query}") as trace:
+            started = time.perf_counter()
+            profile = memory.load_profile()
+            taste = score_preferences(profile)
+            trace.step(
+                "load_taste",
+                {"user": memory.user_id},
+                {
+                    "preferences": describe_profile(profile),
+                    "titles_affected": len(taste),
+                },
+                started,
+            )
+
+            started = time.perf_counter()
+            people, seeds = find_entities(query)
+            trace.step(
+                "recognize_entities",
+                {"query": query},
+                {"people": people, "similar_to": [title for _, title in seeds]},
+                started,
+            )
+
+            started = time.perf_counter()
+            hits = hybrid_search(
+                query=query,
+                top_k=top_k,
+                media_type=media_type,
+                era=era,
+                taste=taste,
+            )
+            trace.step(
+                "hybrid_search",
+                {
+                    "query": query,
+                    "top_k": top_k,
+                    "media_type": media_type,
+                    "era": era,
+                },
+                [
+                    {
+                        "title": hit["metadata"].get("title"),
+                        "score": round(hit["score"], 3),
+                        "semantic": round(hit["similarity"], 3),
+                        "graph": round(hit["graph_bonus"], 3),
+                        "taste": round(hit["taste_bonus"], 3),
+                    }
+                    for hit in hits
+                ],
+                started,
+            )
+
+            trace.summary = summarize_hits(hits)
 
         print_results(query, hits)
+        memory.add_message("assistant", summarize_hits(hits))
+        last_hits = hits
 
         if hits:
             answer = input(
@@ -1187,7 +1574,12 @@ def run_terminal():
             ).strip().lower()
 
             if answer == "y":
-                explain_results(query, hits)
+                text = explain_results(
+                    query, hits, memory_context(memory, query)
+                )
+
+                if text:
+                    memory.add_message("assistant", text)
 
 
 def main():
@@ -1205,6 +1597,8 @@ def main():
             "Is the database running? Try: docker compose up -d"
         ) from error
 
+    memory = MemoryManager()
+
     try:
         catalog = load_catalog()
 
@@ -1215,8 +1609,12 @@ def main():
         sync_graph(catalog)
 
         load_entity_index()
-        run_terminal()
+        load_genre_index()
+
+        memory.start()
+        run_terminal(memory)
     finally:
+        memory.close()
         driver.close()
 
 

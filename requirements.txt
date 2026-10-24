@@ -5,3 +5,5 @@ numpy
 ChromaDB
 Pandas
 neo4j
+neo4j-agent-memory[sentence-transformers]==0.7.0
+httpx>=0.27
